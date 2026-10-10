@@ -195,6 +195,20 @@ func formatSignals(f *FetchResult) string {
 		}
 		b.WriteString(fmt.Sprintf("Stylesheets (%d): %s\n", len(f.Stylesheets), strings.Join(f.Stylesheets[:limit], ", ")))
 	}
+	if len(f.TechStack) > 0 {
+		b.WriteString(fmt.Sprintf("Technologies: %s\n", strings.Join(f.TechStack, ", ")))
+	}
+	if f.Framework != "" {
+		b.WriteString(fmt.Sprintf("Framework: %s\n", f.Framework))
+	}
+	if f.Meta.Description != "" {
+		desc := f.Meta.Description
+		if len(desc) > 240 { desc = desc[:240] + "…" }
+		b.WriteString(fmt.Sprintf("Meta description: %s\n", desc))
+	}
+	if len(f.Stylesheets) > 6 {
+		// already limited above, just ensure count shown
+	}
 	if f.Structure != "" {
 		b.WriteString(fmt.Sprintf("Structure: %s\n", f.Structure))
 	}

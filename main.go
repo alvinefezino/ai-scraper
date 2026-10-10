@@ -40,7 +40,20 @@ type ScrapeResult struct {
 	Stylesheets []string
 	Structure  string
 	Framework  string
+	TechStack  []string
 	Meta       scraper.MetaInfo
+}
+
+type AnalyzeResult struct {
+	ID string
+	URL string
+	Title string
+	Mode string
+	Duration time.Duration
+	Fetch *scraper.FetchResult
+	Output *scraper.RecreationOutput
+	PrettyJSON string
+	Timestamp time.Time
 }
 
 var (
@@ -60,7 +73,10 @@ func main() {
 
 	// Parse templates
 	var err error
-	tmpl, err = template.ParseFiles("templates/index.html")
+	tmpl, err = template.ParseFiles("templates/index.html", "templates/analyze.html")
+	if err != nil {
+		tmpl, err = template.ParseFiles("templates/index.html")
+	}
 	if err != nil {
 		log.Fatalf("template parse: %v", err)
 	}
@@ -74,7 +90,9 @@ func main() {
 	r.Handle("/static/*", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
 
 	r.Get("/", handleIndex)
+	r.Get("/analyze", handleAnalyzePage)
 	r.Post("/scrape", handleScrape)
+	r.Post("/analyze", handleAnalyze)
 	r.Get("/export/csv/{id}", handleCSV)
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 
@@ -87,10 +105,7 @@ func main() {
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	hasKey := os.Getenv("GROQ_API_KEY") != ""
-	tmpl.Execute(w, map[string]interface{}{
-		"HasKey": hasKey,
-		"Model":  envOr("GROQ_MODEL", "qwen/qwen3.8-27b"),
-	})
+	tmpl.ExecuteTemplate(w, "index.html", map[string]interface{}{"HasKey": hasKey, "IsAnalyze": false, "Model": envOr("GROQ_MODEL", "qwen/qwen3-32b")})
 }
 
 func handleScrape(w http.ResponseWriter, r *http.Request) {
@@ -192,7 +207,7 @@ func handleScrape(w http.ResponseWriter, r *http.Request) {
 		Mode: actualMode, Duration: fetch.Duration, CharCount: fetch.CharCount,
 		JSONRaw: prettyJSON, Data: rows, Columns: cols, Timestamp: time.Now(),
 		Images: fetch.Images, Colors: fetch.Colors, ColorCounts: fetch.ColorCounts, Fonts: fetch.Fonts,
-		Stylesheets: fetch.Stylesheets, Structure: fetch.Structure, Framework: fetch.Framework, Meta: fetch.Meta,
+		Stylesheets: fetch.Stylesheets, Structure: fetch.Structure, Framework: fetch.Framework, TechStack: fetch.TechStack, Meta: fetch.Meta,
 	}
 	store[id] = res
 	storeMu.Unlock()
@@ -200,6 +215,209 @@ func handleScrape(w http.ResponseWriter, r *http.Request) {
 	// Render partial
 	renderResults(w, res)
 }
+
+
+func handleAnalyzePage(w http.ResponseWriter, r *http.Request) {
+	hasKey := os.Getenv("GROQ_API_KEY") != ""
+	tmpl.ExecuteTemplate(w, "analyze.html", map[string]interface{}{"HasKey": hasKey, "IsAnalyze": true, "Model": envOr("GROQ_MODEL", "qwen/qwen3-32b")})
+}
+
+func handleAnalyze(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil { renderError(w, "Invalid form data"); return }
+	targetURL := strings.TrimSpace(r.FormValue("url"))
+	mode := r.FormValue("mode")
+	if mode == "" { mode = "auto" }
+	if targetURL == "" { renderError(w, "Please enter a URL to analyze."); return }
+	if !strings.HasPrefix(targetURL, "http") { targetURL = "https://" + targetURL }
+	var fetch *scraper.FetchResult
+	var fetchErr error
+	var actualMode string
+	if mode == "js" {
+		actualMode = "js (headless Chrome)"
+		fetch, fetchErr = scraper.FetchWithJS(targetURL)
+	} else if mode == "static" {
+		actualMode = "static"
+		fetch, fetchErr = scraper.FetchStatic(targetURL)
+	} else {
+		actualMode = "static"
+		fetch, fetchErr = scraper.FetchStatic(targetURL)
+		if fetchErr == nil && len(strings.Fields(fetch.Text)) < 60 {
+			actualMode = "js (auto fallback)"
+			if jsFetch, err := scraper.FetchWithJS(targetURL); err == nil && len(jsFetch.Text) > len(fetch.Text) {
+				fetch = jsFetch
+			}
+		}
+	}
+	if fetchErr != nil { renderError(w, fmt.Sprintf("Fetch failed: %v", fetchErr)); return }
+	if strings.TrimSpace(fetch.Text) == "" { renderError(w, "Page returned no extractable text. Try JS mode or a different URL."); return }
+	out, pretty, aiErr := scraper.GenerateRecreationPrompts(fetch)
+	if aiErr != nil { renderError(w, fmt.Sprintf("Analysis failed: %v", aiErr)); return }
+	storeMu.Lock()
+	idCounter++
+	id := fmt.Sprintf("a%d", idCounter)
+	storeMu.Unlock()
+	res := &AnalyzeResult{ID: id, URL: fetch.URL, Title: fetch.Title, Mode: actualMode, Duration: fetch.Duration, Fetch: fetch, Output: out, PrettyJSON: pretty, Timestamp: time.Now()}
+	renderAnalyzeResults(w, res)
+}
+
+func renderAnalyzeResults(w http.ResponseWriter, res *AnalyzeResult) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	o := res.Output
+	f := res.Fetch
+	var paletteHTML string
+	if len(o.DesignTokens.Palette) > 0 {
+		var pb bytes.Buffer
+		pb.WriteString(`<div class="palette-grid">`)
+		for _, c := range o.DesignTokens.Palette {
+			esc := template.HTMLEscapeString(c)
+			pb.WriteString(fmt.Sprintf(`<button class="swatch" onclick="copyColor('%s')" title="Copy %s"><span class="swatch-color" style="background:%s"></span><span class="swatch-hex">%s</span></button>`, esc, esc, esc, esc))
+		}
+		pb.WriteString(`</div>`)
+		paletteHTML = pb.String()
+	} else if len(f.Colors) > 0 {
+		var pb bytes.Buffer
+		pb.WriteString(`<div class="palette-grid">`)
+		for _, c := range f.Colors[:min(12, len(f.Colors))] {
+			esc := template.HTMLEscapeString(c)
+			pb.WriteString(fmt.Sprintf(`<button class="swatch" onclick="copyColor('%s')"><span class="swatch-color" style="background:%s"></span><span class="swatch-hex">%s</span></button>`, esc, esc, esc))
+		}
+		pb.WriteString(`</div>`)
+		paletteHTML = pb.String()
+	} else {
+		paletteHTML = `<span class="muted" style="font-size:12px">No palette detected</span>`
+	}
+	var flowsHTML string
+	if len(o.Flows) > 0 {
+		var fb bytes.Buffer
+		for _, fl := range o.Flows {
+			fb.WriteString(`<div class="flow-card">`)
+			fb.WriteString(fmt.Sprintf(`<div class="flow-head"><span class="flow-name">%s</span>`, template.HTMLEscapeString(fl.Name)))
+			if fl.CTA != "" { fb.WriteString(fmt.Sprintf(`<span class="flow-cta">%s</span>`, template.HTMLEscapeString(fl.CTA))) }
+			fb.WriteString(`</div>`)
+			if len(fl.Steps) > 0 {
+				fb.WriteString(`<ol class="flow-steps">`)
+				for _, s := range fl.Steps { fb.WriteString(fmt.Sprintf(`<li>%s</li>`, template.HTMLEscapeString(s))) }
+				fb.WriteString(`</ol>`)
+			}
+			fb.WriteString(`</div>`)
+		}
+		flowsHTML = fb.String()
+	} else { flowsHTML = `<span class="muted" style="font-size:12px">No flows inferred</span>` }
+	var sectionsHTML string
+	if len(o.Structure.Sections) > 0 {
+		var sb bytes.Buffer
+		sb.WriteString(`<div class="section-chips">`)
+		for _, s := range o.Structure.Sections { sb.WriteString(fmt.Sprintf(`<span class="section-chip">%s</span>`, template.HTMLEscapeString(s))) }
+		sb.WriteString(`</div>`)
+		sectionsHTML = sb.String()
+	}
+	var techHTML string
+	if len(f.TechStack) > 0 {
+		var tb bytes.Buffer
+		tb.WriteString(`<div class="tech-chips">`)
+		for _, t := range f.TechStack {
+			tb.WriteString(fmt.Sprintf(`<span class="tech-chip">%s</span>`, template.HTMLEscapeString(t)))
+		}
+		tb.WriteString(`</div>`)
+		techHTML = tb.String()
+	} else {
+		techHTML = `<span class="muted" style="font-size:12px">No stack detected</span>`
+	}
+	var promptsHTML string
+	if len(o.Prompts) > 0 {
+		var prb bytes.Buffer
+		for i, p := range o.Prompts {
+			prb.WriteString(fmt.Sprintf(`<div class="prompt-card"><div class="prompt-head"><span class="prompt-title">%s</span><span class="prompt-target">%s</span></div><div class="prompt-body">%s</div><div class="prompt-actions"><button class="btn btn-ghost btn-xs" onclick="copyText(document.getElementById('prompt-%s-%d').textContent,'Prompt copied')">`+iconCopy()+` Copy prompt</button></div><pre id="prompt-%s-%d" style="display:none">%s</pre></div>`, template.HTMLEscapeString(p.Title), template.HTMLEscapeString(p.Target), template.HTMLEscapeString(p.Prompt), res.ID, i, res.ID, i, template.HTMLEscapeString(p.Prompt)))
+		}
+		promptsHTML = prb.String()
+	} else { promptsHTML = `<span class="muted" style="font-size:12px">No prompts generated</span>` }
+	jsonEsc := template.HTMLEscapeString(res.PrettyJSON)
+	fmt.Fprintf(w, `
+<div id="results" class="results-card analyze-results">
+  <div class="results-head">
+    <div class="results-meta">
+      <span class="badge badge-ok">%s</span>
+      <span class="meta-dot">·</span><span class="meta-text">%s</span>
+      <span class="meta-dot">·</span><span class="meta-text">%.1fs</span>
+      <span class="meta-dot">·</span><span class="meta-text">%d colors</span>
+      <span class="meta-dot">·</span><span class="meta-text">%d images</span>
+    </div>
+    <div class="results-actions">
+      <button class="btn btn-ghost" onclick="copyText(document.getElementById('analyzeJson-%s').value,'JSON copied')">`+iconCopy()+` Copy JSON</button>
+    </div>
+  </div>
+  <div class="title-row"><span class="title-label">Page</span><span class="title-value">%s</span></div>
+  <div class="url-row"><a href="%s" target="_blank" rel="noopener">%s</a><span class="framework-badge" style="margin-left:8px">%s</span></div>
+  <p class="analyze-summary">%s</p>
+  <div class="analyze-grid">
+    <div class="analyze-section">
+      <h4 class="design-title">Layout</h4>
+      <p class="meta-desc">%s</p>
+      %s
+      <div class="structure-mini"><span class="muted" style="font-size:11px">Navigation:</span> %s</div>
+      <pre class="structure-pre" style="margin-top:10px">%s</pre>
+    </div>
+    <div class="analyze-section">
+      <h4 class="design-title">Flows & CTAs</h4>
+      %s
+    </div>
+  </div>
+  <div class="analyze-grid" style="margin-top:14px">
+    <div class="analyze-section">
+      <h4 class="design-title">Design tokens</h4>
+      <div class="token-block"><span class="token-label">Palette</span>%s</div>
+      <div class="token-block"><span class="token-label">Usage</span><p class="meta-desc">%s</p></div>
+      <div class="token-block"><span class="token-label">Typography</span><p class="meta-desc">%s</p></div>
+      <div class="token-block"><span class="token-label">Styling</span><p class="meta-desc">%s</p></div>
+      <span class="vibe-badge">%s</span>
+    </div>
+    <div class="analyze-section">
+      <h4 class="design-title">Technologies</h4>
+      %s
+      <div style="margin-top:12px"></div>
+      <h4 class="design-title" style="margin-top:12px">Detected signals</h4>
+      <div class="signal-row"><span class="muted">Fonts</span><span>%s</span></div>
+      <div class="signal-row"><span class="muted">Stack count</span><span>%d</span></div>
+      <div class="signal-row"><span class="muted">Images</span><span>%d found</span></div>
+      <div class="signal-row"><span class="muted">Stylesheets</span><span>%d linked</span></div>
+    </div>
+  </div>
+  <h4 class="design-title" style="margin-top:16px">Rebuild prompts — copy & paste</h4>
+  <div class="prompts-grid">%s</div>
+  <details class="json-details"><summary>Raw analysis JSON</summary><div class="json-wrap"><pre>%s</pre></div><textarea id="analyzeJson-%s" style="display:none">%s</textarea></details>
+</div>
+<script>if(window.__scraperInit) window.__scraperInit();</script>
+`,
+		template.HTMLEscapeString(o.SiteType),
+		template.HTMLEscapeString(res.Mode),
+		res.Duration.Seconds(),
+		len(f.Colors), len(f.Images),
+		res.ID,
+		template.HTMLEscapeString(firstNonEmpty(res.Title, res.URL)),
+		template.HTMLEscapeString(res.URL), template.HTMLEscapeString(res.URL),
+		template.HTMLEscapeString(firstNonEmpty(f.Framework, o.Structure.FrameworkHint)),
+		template.HTMLEscapeString(o.Summary),
+		template.HTMLEscapeString(o.Structure.Layout),
+		sectionsHTML,
+		template.HTMLEscapeString(o.Structure.Navigation),
+		template.HTMLEscapeString(firstNonEmpty(o.Structure.Headings, f.Structure)),
+		flowsHTML,
+		paletteHTML,
+		template.HTMLEscapeString(o.DesignTokens.PaletteUsage),
+		template.HTMLEscapeString(o.DesignTokens.Typography),
+		template.HTMLEscapeString(o.DesignTokens.Styling),
+		template.HTMLEscapeString(o.DesignTokens.Vibe),
+		techHTML,
+		template.HTMLEscapeString(strings.Join(f.Fonts, ", ")),
+		len(f.TechStack),
+		len(f.Images), len(f.Stylesheets),
+		promptsHTML,
+		jsonEsc,
+		res.ID, jsonEsc,
+	)
+}
+
+func min(a,b int) int { if a<b { return a }; return b }
 
 func renderResults(w http.ResponseWriter, res *ScrapeResult) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

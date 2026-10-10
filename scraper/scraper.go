@@ -31,6 +31,7 @@ type FetchResult struct {
 	Structure   string      `json:"structure"`
 	Audio       []AudioInfo `json:"audio"`
 	Framework   string      `json:"framework"`
+	TechStack   []string   `json:"tech_stack"`
 	Meta        MetaInfo    `json:"meta"`
 }
 
@@ -86,7 +87,7 @@ func FetchStatic(targetURL string) (*FetchResult, error) {
 	}
 	html := string(body)
 	text, title := cleanHTML(html)
-	images, colors, colorCounts, fonts, sheets, structure, audio, framework, meta := extractSignals(html, targetURL)
+	images, colors, colorCounts, fonts, sheets, structure, audio, framework, techStack, meta := extractSignals(html, targetURL)
 	// Optionally enrich with external CSS (best-effort, short timeout)
 	if len(sheets) > 0 {
 		ext := fetchExternalCSS(sheets[:min(3, len(sheets))])
@@ -101,7 +102,7 @@ func FetchStatic(targetURL string) (*FetchResult, error) {
 		HTML: html, Text: text, Title: title, URL: targetURL,
 		Duration: time.Since(start), CharCount: len(text),
 		Images: images, Colors: colors, ColorCounts: colorCounts, Fonts: fonts, Stylesheets: sheets, Structure: structure, Audio: audio,
-		Framework: framework, Meta: meta,
+		Framework: framework, TechStack: techStack, Meta: meta,
 	}, nil
 }
 
@@ -168,7 +169,7 @@ func FetchWithJS(targetURL string) (*FetchResult, error) {
 		}
 	}
 	text, title := cleanHTML(html)
-	images, colors, colorCounts, fonts, sheets, structure, audio, framework, meta := extractSignals(html, targetURL)
+	images, colors, colorCounts, fonts, sheets, structure, audio, framework, techStack, meta := extractSignals(html, targetURL)
 
 	// Merge JS-computed signals
 	if len(jsData.Colors) > 0 {
@@ -239,14 +240,14 @@ func FetchWithJS(targetURL string) (*FetchResult, error) {
 		HTML: html, Text: text, Title: title, URL: targetURL,
 		Duration: time.Since(start), CharCount: len(text),
 		Images: images, Colors: colors, ColorCounts: colorCounts, Fonts: fonts, Stylesheets: sheets, Structure: structure, Audio: audio,
-		Framework: framework, Meta: meta,
+		Framework: framework, TechStack: techStack, Meta: meta,
 	}, nil
 }
 
-func extractSignals(rawHTML, baseURL string) (images []ImageInfo, colors []string, colorCounts map[string]int, fonts []string, sheets []string, structure string, audio []AudioInfo, framework string, meta MetaInfo) {
+func extractSignals(rawHTML, baseURL string) (images []ImageInfo, colors []string, colorCounts map[string]int, fonts []string, sheets []string, structure string, audio []AudioInfo, framework string, techStack []string, meta MetaInfo) {
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(rawHTML))
 	if err != nil {
-		return nil, nil, nil, nil, nil, "", nil, "", MetaInfo{}
+		return nil, nil, nil, nil, nil, "", nil, "", nil, MetaInfo{}
 	}
 	base, _ := url.Parse(baseURL)
 	seenImg := map[string]bool{}
@@ -597,7 +598,98 @@ func extractSignals(rawHTML, baseURL string) (images []ImageInfo, colors []strin
 	if len(structure) > 1800 {
 		structure = structure[:1800] + "..."
 	}
-	return images, colors, colorCounts, fonts, sheets, structure, audio, framework, meta
+	techStack = detectTechStack(doc, rawHTML, lowerHTML, sheets, framework)
+	return images, colors, colorCounts, fonts, sheets, structure, audio, framework, techStack, meta
+}
+
+
+func detectTechStack(doc *goquery.Document, rawHTML, lowerHTML string, sheets []string, framework string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(name string) {
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	contains := func(sub string) bool { return strings.Contains(lowerHTML, sub) }
+	// JS frameworks
+	if contains("__next_data__") || contains("_next/static") || contains("next/image") {
+		add("Next.js")
+	}
+	if contains("react") && (contains("react-dom") || contains("react.development") || contains("__react")) {
+		add("React")
+	} else if contains("react") && contains("next") {
+		add("React")
+	}
+	if contains("vue") || contains("nuxt") {
+		if contains("nuxt") { add("Nuxt") } else { add("Vue.js") }
+	}
+	if contains("angular") { add("Angular") }
+	if contains("svelte") { add("Svelte") }
+	if contains("astro") { add("Astro") }
+	if contains("remix") { add("Remix") }
+	// CSS
+	if framework != "" { add(framework) }
+	if contains("tailwind") { add("Tailwind CSS") }
+	if contains("bootstrap") { add("Bootstrap") }
+	if contains("bulma") { add("Bulma") }
+	if contains("chakra") { add("Chakra UI") }
+	// CMS / site builders
+	if contains("wp-content") || contains("wp-includes") || contains("wordpress") { add("WordPress") }
+	if contains("shopify") || contains("cdn.shopify") { add("Shopify") }
+	if contains("webflow") { add("Webflow") }
+	if contains("wix.com") || contains("wixstatic") { add("Wix") }
+	if contains("squarespace") { add("Squarespace") }
+	if contains("contentful") { add("Contentful") }
+	if contains("sanity.io") { add("Sanity") }
+	// Libraries
+	if contains("jquery") { add("jQuery") }
+	if contains("gsap") { add("GSAP") }
+	if contains("framer") { add("Framer Motion") }
+	if contains("three.js") || contains("threejs") { add("Three.js") }
+	if contains("gsap") { add("GSAP") }
+	// Analytics / marketing
+	if contains("googletagmanager") || contains("google-analytics") || contains("gtag(") { add("Google Analytics") }
+	if contains("googletagmanager.com/gtm") || contains("gtm.js") { add("Google Tag Manager") }
+	if contains("hotjar") { add("Hotjar") }
+	if contains("segment.com") || contains("segment.io") { add("Segment") }
+	if contains("mixpanel") { add("Mixpanel") }
+	if contains("facebook.net/tr") || contains("connect.facebook.net") { add("Meta Pixel") }
+	// Payments / commerce
+	if contains("stripe") { add("Stripe") }
+	if contains("paypal") { add("PayPal") }
+	// Infra / CDN
+	if contains("cloudflare") { add("Cloudflare") }
+	if contains("vercel") { add("Vercel") }
+	if contains("netlify") { add("Netlify") }
+	if contains("__cf") { add("Cloudflare") }
+	// Build
+	if contains("vite") { add("Vite") }
+	if contains("webpack") { add("Webpack") }
+	// Check script/link sources more precisely
+	doc.Find("script[src], link[href]").Each(func(_ int, sel *goquery.Selection) {
+		src, _ := sel.Attr("src")
+		if src == "" { src, _ = sel.Attr("href") }
+		low := strings.ToLower(src)
+		if strings.Contains(low, "next/static") && !seen["Next.js"] { add("Next.js") }
+		if strings.Contains(low, "wp-content") && !seen["WordPress"] { add("WordPress") }
+		if strings.Contains(low, "shopify") && !seen["Shopify"] { add("Shopify") }
+		if strings.Contains(low, "googletagmanager") && !seen["Google Analytics"] { add("Google Analytics") }
+	})
+	// Stylesheet hints
+	for _, sh := range sheets {
+		low := strings.ToLower(sh)
+		if strings.Contains(low, "tailwind") && !seen["Tailwind CSS"] { add("Tailwind CSS") }
+		if strings.Contains(low, "bootstrap") && !seen["Bootstrap"] { add("Bootstrap") }
+	}
+	if len(out) == 0 {
+		out = append(out, "HTML/CSS/JS")
+	}
+	if len(out) > 14 {
+		out = out[:14]
+	}
+	return out
 }
 
 func extractColorsFromBlob(blob string, existing map[string]int) ([]string, map[string]int) {
