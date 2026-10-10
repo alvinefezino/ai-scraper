@@ -1,0 +1,5 @@
+ai-scraper.exe
+ai-scraper
+.env
+*.log
+.vercel
