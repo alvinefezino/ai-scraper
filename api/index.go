@@ -2,10 +2,12 @@ package handler
 
 import (
 	"bytes"
+	"embed"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -18,6 +20,12 @@ import (
 
 	"ai-scraper/scraper"
 )
+
+//go:embed templates/*.html
+var templateFS embed.FS
+
+//go:embed static/*
+var staticFS embed.FS
 
 type ScrapeResult struct {
 	ID          string
@@ -68,17 +76,10 @@ var (
 func getTmpl() *template.Template {
 	tmplOnce.Do(func() {
 		var err error
-		// Vercel wd is project root; try both locations
-		candidates := [][]string{{"templates/index.html", "templates/analyze.html"}, {"../templates/index.html", "../templates/analyze.html"}, {"./templates/index.html", "./templates/analyze.html"}}
-	for _, pp := range candidates {
-			tmpl, err = template.ParseFiles(pp[0], pp[1])
-			if err == nil { return }
+		tmpl, err = template.ParseFS(templateFS, "templates/index.html", "templates/analyze.html")
+		if err != nil {
+			log.Printf("template parse (embed) failed: %v", err)
 		}
-	for _, q := range []string{"templates/index.html", "../templates/index.html", "./templates/index.html"} {
-			tmpl, err = template.ParseFiles(q)
-			if err == nil { return }
-		}
-		log.Printf("template parse failed: %v", err)
 	})
 	return tmpl
 }
@@ -88,12 +89,9 @@ func getRouter() http.Handler {
 		r := chi.NewRouter()
 		r.Use(middleware.Recoverer)
 		r.Use(middleware.Compress(5))
-		// static files
-		for _, dir := range []string{"static", "../static", "./static"} {
-			if _, err := os.Stat(dir); err == nil {
-				r.Handle("/static/*", http.StripPrefix("/static/", http.FileServer(http.Dir(dir))))
-				break
-			}
+		// static files from embedded FS
+		if sub, err := fs.Sub(staticFS, "static"); err == nil {
+			r.Handle("/static/*", http.StripPrefix("/static/", http.FileServer(http.FS(sub))))
 		}
 		r.Get("/", handleIndex)
 		r.Get("/analyze", handleAnalyzePage)

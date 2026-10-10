@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"embed"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -19,6 +21,12 @@ import (
 
 	"ai-scraper/scraper"
 )
+
+//go:embed templates/*.html
+var templateFS embed.FS
+
+//go:embed static/*
+var staticFS embed.FS
 
 type ScrapeResult struct {
 	ID         string
@@ -71,11 +79,11 @@ func main() {
 		port = "3000"
 	}
 
-	// Parse templates
+	// Parse templates from embedded FS (works locally and on Vercel)
 	var err error
-	tmpl, err = template.ParseFiles("templates/index.html", "templates/analyze.html")
+	tmpl, err = template.ParseFS(templateFS, "templates/index.html", "templates/analyze.html")
 	if err != nil {
-		tmpl, err = template.ParseFiles("templates/index.html")
+		tmpl, err = template.ParseFS(templateFS, "templates/index.html")
 	}
 	if err != nil {
 		log.Fatalf("template parse: %v", err)
@@ -86,8 +94,10 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Compress(5))
 
-	// Static
-	r.Handle("/static/*", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
+	// Static from embedded FS
+	if sub, err := fs.Sub(staticFS, "static"); err == nil {
+		r.Handle("/static/*", http.StripPrefix("/static/", http.FileServer(http.FS(sub))))
+	}
 
 	r.Get("/", handleIndex)
 	r.Get("/analyze", handleAnalyzePage)
