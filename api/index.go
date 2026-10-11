@@ -94,11 +94,18 @@ func getRouter() http.Handler {
 			r.Handle("/static/*", http.StripPrefix("/static/", http.FileServer(http.FS(sub))))
 		}
 		r.Get("/", handleIndex)
+		r.Get("/api", handleIndex)
+		r.Get("/api/index", handleIndex)
 		r.Get("/analyze", handleAnalyzePage)
+		r.Get("/api/analyze", handleAnalyzePage)
 		r.Post("/scrape", handleScrape)
+		r.Post("/api/scrape", handleScrape)
 		r.Post("/analyze", handleAnalyze)
+		r.Post("/api/analyze", handleAnalyze)
 		r.Get("/export/csv/{id}", handleCSV)
+		r.Get("/api/export/csv/{id}", handleCSV)
 		r.Get("/health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
+		r.Get("/api/health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 		router = r
 	})
 	return router
@@ -106,6 +113,17 @@ func getRouter() http.Handler {
 
 // Handler is the Vercel serverless entry point.
 func Handler(w http.ResponseWriter, r *http.Request) {
+	// Vercel rewrite / -> /api/index means r.URL.Path can be /api/index
+	// Normalize so chi routes defined at / match.
+	if r.URL.Path == "/api/index" || r.URL.Path == "/api" {
+		r.URL.Path = "/"
+	} else if strings.HasPrefix(r.URL.Path, "/api/index/") {
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/api/index")
+		if r.URL.Path == "" {
+			r.URL.Path = "/"
+		}
+	}
+	// Also handle /api/index serving as fallback for root when rewrites misfire
 	getRouter().ServeHTTP(w, r)
 }
 
