@@ -93,6 +93,28 @@ func main() {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Compress(5))
+	// Vercel rewrite /(.*) -> /api/index means requests arrive as /api/index; normalize before routing
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			orig := r.URL.Path
+			if r.URL.Path == "/api/index" || r.URL.Path == "/api" || r.URL.Path == "/api/index.go" {
+				r.URL.Path = "/"
+			} else if strings.HasPrefix(r.URL.Path, "/api/") {
+				p2 := strings.TrimPrefix(r.URL.Path, "/api")
+				if strings.HasPrefix(p2, "/index") {
+					p2 = strings.TrimPrefix(p2, "/index")
+				}
+				if p2 == "" {
+					p2 = "/"
+				}
+				r.URL.Path = p2
+			}
+			if r.URL.Path != orig {
+				log.Printf("normalize %q -> %q", orig, r.URL.Path)
+			}
+			next.ServeHTTP(w, r)
+		})
+	})
 
 	// Static from embedded FS
 	if sub, err := fs.Sub(staticFS, "static"); err == nil {
