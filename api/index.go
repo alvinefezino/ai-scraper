@@ -111,7 +111,18 @@ func getRouter() http.Handler {
 // Handler is the Vercel serverless entry point.
 func Handler(w http.ResponseWriter, r *http.Request) {
 	orig := r.URL.Path
-	log.Printf("Handler hit path=%q raw=%q qs=%q method=%s", orig, r.URL.RequestURI(), r.URL.RawQuery, r.Method)
+	log.Printf("Handler hit path=%q raw=%q qs=%q method=%s host=%q", orig, r.URL.RequestURI(), r.URL.RawQuery, r.Method, r.Host)
+	// Direct health check bypassing chi
+	if r.URL.Path == "/health" || r.URL.Path == "/api/health" {
+		w.Write([]byte("ok"))
+		return
+	}
+	// Debug: if ?debug=1, dump path info
+	if r.URL.Query().Get("debug") == "1" {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "path=%q raw=%q method=%s host=%q handler=ok\n", r.URL.Path, r.URL.RequestURI(), r.Method, r.Host)
+		return
+	}
 	// Vercel rewrite / -> /api/index means r.URL.Path can be /api/index
 	// Normalize so chi routes defined at / match.
 	if r.URL.Path == "/api/index" || r.URL.Path == "/api" || r.URL.Path == "/api/index.go" {
@@ -129,6 +140,20 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path != orig {
 		log.Printf("Handler normalized %q -> %q", orig, r.URL.Path)
+	}
+	// Fallback: serve index directly if router would 404 - helps diagnose chi issue
+	if r.URL.Path == "/" {
+		t := getTmpl()
+		if t != nil {
+			hasKey := os.Getenv("GROQ_API_KEY") != ""
+			if err := t.ExecuteTemplate(w, "index.html", map[string]interface{}{"HasKey": hasKey, "IsAnalyze": false, "Model": envOr("GROQ_MODEL", "qwen/qwen3-32b")}); err == nil {
+				return
+			} else {
+				log.Printf("template execute failed: %v", err)
+			}
+		} else {
+			log.Printf("template nil")
+		}
 	}
 	getRouter().ServeHTTP(w, r)
 }
