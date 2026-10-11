@@ -49,10 +49,7 @@ func ExtractWithGroqFromFetch(fetch *FetchResult, userPrompt string) (interface{
 	}
 	model := os.Getenv("GROQ_MODEL")
 	if model == "" {
-		model = "qwen/qwen3.8-27b"
-	}
-	if model == "llama-3.3-70b-versatile" || model == "llama-3.1-8b-instant" || model == "qwen/qwen3-32b" {
-		model = "qwen/qwen3.8-27b"
+		model = "qwen/qwen3-32b"
 	}
 	systemPrompt := "You are an expert web scraping extractor. Given cleaned page text plus unrestricted page signals and a user's instruction, return ONLY valid JSON.\n\nRules:\n- Output MUST be a JSON array of objects. Each object is one item.\n- If nothing matches, return [].\n- Keys should be snake_case inferred from the user's instruction.\n- Keep values concise. Prices as strings with currency if present.\n- Do NOT wrap in markdown fences. Do NOT add explanation. ONLY the JSON array.\n- No restriction on domain: web structures, headings, music or track or song names, image names alts and URLs, styling, color palettes, fonts, layouts. Extract exactly what the user asks without filtering."
 	signals := formatSignals(fetch)
@@ -66,42 +63,73 @@ func ExtractWithGroqFromFetch(fetch *FetchResult, userPrompt string) (interface{
 			{Role: "user", Content: userContent},
 		},
 	}
-	payload, _ := json.Marshal(reqBody)
+	// Build ordered model list: primary + fallbacks (matches recreate.go)
+	fallbacks := []string{"llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"}
+	modelsToTry := []string{model}
+	for _, fb := range fallbacks {
+		if fb != model {
+			modelsToTry = append(modelsToTry, fb)
+		}
+	}
 	client := &http.Client{Timeout: 45 * time.Second}
 	var body []byte
 	var status int
-	var headers http.Header
-	for attempt := 0; attempt < 3; attempt++ {
-		req, err := http.NewRequest("POST", "https://api.groq.com/openai/v1/chat/completions", bytes.NewReader(payload))
-		if err != nil {
-			return nil, "", err
-		}
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, "", fmt.Errorf("groq request failed: %w", err)
-		}
-		b, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		status = resp.StatusCode
-		headers = resp.Header
-		body = b
-		if status == 429 && attempt < 2 {
-			wait := time.Duration(2+attempt*4) * time.Second
-			if ra := headers.Get("Retry-After"); ra != "" {
-				if d, err := time.ParseDuration(ra + "s"); err == nil {
-					wait = d + 500*time.Millisecond
-				}
+	var lastErr string
+	var grBody []byte
+	tried := ""
+ModelLoop2:
+	for _, m := range modelsToTry {
+		reqBody.Model = m
+		payload, _ := json.Marshal(reqBody)
+		var headers http.Header
+		for attempt := 0; attempt < 3; attempt++ {
+			req, err := http.NewRequest("POST", "https://api.groq.com/openai/v1/chat/completions", bytes.NewReader(payload))
+			if err != nil {
+				return nil, "", err
 			}
-			time.Sleep(wait)
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			if err != nil {
+				return nil, "", fmt.Errorf("groq request failed: %w", err)
+			}
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			status = resp.StatusCode
+			headers = resp.Header
+			body = b
+			grBody = b
+			if status == 429 && attempt < 2 {
+				wait := time.Duration(2+attempt*4) * time.Second
+				if ra := headers.Get("Retry-After"); ra != "" {
+					if d, err := time.ParseDuration(ra + "s"); err == nil {
+						wait = d + 500*time.Millisecond
+					}
+				}
+				time.Sleep(wait)
+				continue
+			}
+			break
+		}
+		tried += m + " "
+		if status == 200 {
+			break ModelLoop2
+		}
+		bs := string(body)
+		isModelNotFound := status == 404 && (strings.Contains(bs, "model_not_found") || strings.Contains(bs, "does not exist"))
+		if isModelNotFound {
+			lastErr = fmt.Sprintf("groq %d (%s): %s", status, m, bs)
 			continue
 		}
-		break
+		return nil, "", fmt.Errorf("groq %d (%s): %s", status, m, bs)
 	}
 	if status != 200 {
-		return nil, "", fmt.Errorf("groq %d: %s", status, string(body))
+		if lastErr != "" {
+			return nil, "", fmt.Errorf("%s (tried: %s)", lastErr, strings.TrimSpace(tried))
+		}
+		return nil, "", fmt.Errorf("groq %d: %s", status, string(grBody))
 	}
+	body = grBody
 	var gr GroqResponse
 	if err := json.Unmarshal(body, &gr); err != nil {
 		return nil, "", fmt.Errorf("groq parse error: %w", err)

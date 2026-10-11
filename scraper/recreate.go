@@ -58,8 +58,8 @@ func GenerateRecreationPrompts(fetch *FetchResult) (*RecreationOutput, string, e
 	if model == "" {
 		model = "qwen/qwen3-32b"
 	}
-	// migrate old models
-	if model == "llama-3.3-70b-versatile" || model == "llama-3.1-8b-instant" || model == "qwen/qwen3.8-27b" || model == "qwen/qwen3-27b" {
+	// migrate legacy ids; keep qwen/qwen3-32b as primary (fallback handled below on 404)
+	if model == "qwen/qwen3.8-27b" || model == "qwen/qwen3-27b" {
 		model = "qwen/qwen3-32b"
 	}
 
@@ -112,42 +112,74 @@ Rules:
 			{Role: "user", Content: userContent},
 		},
 	}
-	payload, _ := json.Marshal(reqBody)
+	// Build ordered model list: primary + fallbacks (avoids 422 when primary not entitled)
+	fallbacks := []string{"llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"}
+	modelsToTry := []string{model}
+	for _, fb := range fallbacks {
+		if fb != model {
+			modelsToTry = append(modelsToTry, fb)
+		}
+	}
 	client := &http.Client{Timeout: 60 * time.Second}
 	var body []byte
 	var status int
-	var headers http.Header
-	for attempt := 0; attempt < 3; attempt++ {
-		req, err := http.NewRequest("POST", "https://api.groq.com/openai/v1/chat/completions", bytes.NewReader(payload))
-		if err != nil {
-			return nil, "", err
-		}
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, "", fmt.Errorf("groq request failed: %w", err)
-		}
-		b, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		status = resp.StatusCode
-		headers = resp.Header
-		body = b
-		if status == 429 && attempt < 2 {
-			wait := time.Duration(2+attempt*4) * time.Second
-			if ra := headers.Get("Retry-After"); ra != "" {
-				if d, err := time.ParseDuration(ra + "s"); err == nil {
-					wait = d + 500*time.Millisecond
-				}
+	var lastErr string
+	var grBody []byte
+	tried := ""
+ModelLoop:
+	for _, m := range modelsToTry {
+		reqBody.Model = m
+		payload, _ := json.Marshal(reqBody)
+		var headers http.Header
+		for attempt := 0; attempt < 3; attempt++ {
+			req, err := http.NewRequest("POST", "https://api.groq.com/openai/v1/chat/completions", bytes.NewReader(payload))
+			if err != nil {
+				return nil, "", err
 			}
-			time.Sleep(wait)
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			if err != nil {
+				return nil, "", fmt.Errorf("groq request failed: %w", err)
+			}
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			status = resp.StatusCode
+			headers = resp.Header
+			body = b
+			grBody = b
+			if status == 429 && attempt < 2 {
+				wait := time.Duration(2+attempt*4) * time.Second
+				if ra := headers.Get("Retry-After"); ra != "" {
+					if d, err := time.ParseDuration(ra + "s"); err == nil {
+						wait = d + 500*time.Millisecond
+					}
+				}
+				time.Sleep(wait)
+				continue
+			}
+			break
+		}
+		tried += m + " "
+		if status == 200 {
+			break ModelLoop
+		}
+		bs := string(body)
+		isModelNotFound := status == 404 && (strings.Contains(bs, "model_not_found") || strings.Contains(bs, "does not exist") || strings.Contains(bs, "model_not_found"))
+		if isModelNotFound {
+			lastErr = fmt.Sprintf("groq %d (%s): %s", status, m, bs)
 			continue
 		}
-		break
+		// non-model error: surface directly
+		return nil, "", fmt.Errorf("groq %d (%s): %s", status, m, bs)
 	}
 	if status != 200 {
-		return nil, "", fmt.Errorf("groq %d: %s", status, string(body))
+		if lastErr != "" {
+			return nil, "", fmt.Errorf("%s (tried: %s)", lastErr, strings.TrimSpace(tried))
+		}
+		return nil, "", fmt.Errorf("groq %d: %s", status, string(grBody))
 	}
+	body = grBody
 	var gr GroqResponse
 	if err := json.Unmarshal(body, &gr); err != nil {
 		return nil, "", fmt.Errorf("groq parse error: %w", err)
