@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
-	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -23,9 +22,6 @@ import (
 
 //go:embed templates/*.html
 var templateFS embed.FS
-
-//go:embed static/*
-var staticFS embed.FS
 
 type ScrapeResult struct {
 	ID          string
@@ -89,10 +85,7 @@ func getRouter() http.Handler {
 		r := chi.NewRouter()
 		r.Use(middleware.Recoverer)
 		r.Use(middleware.Compress(5))
-		// static files from embedded FS
-		if sub, err := fs.Sub(staticFS, "static"); err == nil {
-			r.Handle("/static/*", http.StripPrefix("/static/", http.FileServer(http.FS(sub))))
-		}
+		// static files served by Vercel from /static (not via Go)
 		r.Get("/", handleIndex)
 		r.Get("/api", handleIndex)
 		r.Get("/api/index", handleIndex)
@@ -106,6 +99,10 @@ func getRouter() http.Handler {
 		r.Get("/api/export/csv/{id}", handleCSV)
 		r.Get("/health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 		r.Get("/api/health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
+		r.NotFound(func(w http.ResponseWriter, r *http.Request) {
+			log.Printf("NotFound path=%q method=%s", r.URL.Path, r.Method)
+			http.NotFound(w, r)
+		})
 		router = r
 	})
 	return router
@@ -113,17 +110,26 @@ func getRouter() http.Handler {
 
 // Handler is the Vercel serverless entry point.
 func Handler(w http.ResponseWriter, r *http.Request) {
+	orig := r.URL.Path
+	log.Printf("Handler hit path=%q raw=%q qs=%q method=%s", orig, r.URL.RequestURI(), r.URL.RawQuery, r.Method)
 	// Vercel rewrite / -> /api/index means r.URL.Path can be /api/index
 	// Normalize so chi routes defined at / match.
-	if r.URL.Path == "/api/index" || r.URL.Path == "/api" {
+	if r.URL.Path == "/api/index" || r.URL.Path == "/api" || r.URL.Path == "/api/index.go" {
 		r.URL.Path = "/"
-	} else if strings.HasPrefix(r.URL.Path, "/api/index/") {
-		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/api/index")
-		if r.URL.Path == "" {
-			r.URL.Path = "/"
+	} else if strings.HasPrefix(r.URL.Path, "/api/index/") || strings.HasPrefix(r.URL.Path, "/api/") {
+		// strip /api prefix so /api/analyze -> /analyze etc.
+		p2 := strings.TrimPrefix(r.URL.Path, "/api")
+		if strings.HasPrefix(p2, "/index") {
+			p2 = strings.TrimPrefix(p2, "/index")
 		}
+		if p2 == "" {
+			p2 = "/"
+		}
+		r.URL.Path = p2
 	}
-	// Also handle /api/index serving as fallback for root when rewrites misfire
+	if r.URL.Path != orig {
+		log.Printf("Handler normalized %q -> %q", orig, r.URL.Path)
+	}
 	getRouter().ServeHTTP(w, r)
 }
 
