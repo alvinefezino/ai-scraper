@@ -130,7 +130,7 @@ func main() {
 	r.Get("/export/csv/{id}", handleCSV)
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 
-	fmt.Printf("\n  AI Scraper running → http://localhost:%s\n", port)
+	fmt.Printf("\n  ScrapeShape running → http://localhost:%s\n", port)
 	if os.Getenv("GROQ_API_KEY") == "" {
 		fmt.Println("  [!] GROQ_API_KEY not set. Create .env from .env.example")
 	}

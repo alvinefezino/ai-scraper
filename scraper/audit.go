@@ -638,7 +638,7 @@ func fixFor(cat string, is AuditIssue) string {
 	case "Missing meta description":
 		return "Add <meta name=\"description\" content=\"Benefit-led 140-char summary with primary keyword.\">"
 	case "No H1 found":
-		return "Add one H1 matching user intent, e.g. <h1>Ship faster with ScrapeAI</h1>."
+		return "Add one H1 matching user intent, e.g. <h1>Ship faster with ScrapeShape</h1>."
 	case "Missing html lang":
 		return "Set <html lang=\"en\"> (or appropriate locale)."
 	case "Missing viewport meta":
@@ -670,7 +670,7 @@ func fixFor(cat string, is AuditIssue) string {
 func codeFor(cat string, is AuditIssue) string {
 	switch is.Title {
 	case "Missing <title>":
-		return "<title>ScrapeAI — Extract data and rebuild any site from a URL</title>"
+		return "<title>ScrapeShape — Scrape any site, shape its rebuild</title>"
 	case "Missing meta description":
 		return "<meta name=\"description\" content=\"Paste any URL to extract tables, colors, fonts, and rebuild prompts. Built for makers shipping fast.\">"
 	case "No H1 found":
