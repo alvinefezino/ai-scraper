@@ -55,6 +55,8 @@ type AnalyzeResult struct {
 	Duration time.Duration
 	Fetch *scraper.FetchResult
 	Output *scraper.RecreationOutput
+	Audit *scraper.AuditResult
+	AuditJSON string
 	PrettyJSON string
 	Timestamp time.Time
 }
@@ -317,18 +319,78 @@ func handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(fetch.Text) == "" { renderError(w, "Page returned no extractable text. Try a different URL."); return }
 	out, pretty, aiErr := scraper.GenerateRecreationPrompts(fetch)
 	if aiErr != nil { renderError(w, fmt.Sprintf("Analysis failed: %v", aiErr)); return }
+	heuristic := scraper.ComputeHeuristicAudit(fetch)
+	audit := heuristic
+	auditJSON := ""
+	if heuristic != nil {
+		if b, err := json.MarshalIndent(heuristic, "", "  "); err == nil {
+			auditJSON = string(b)
+		}
+		if enriched, enrichedJSON, _ := scraper.GenerateAuditRecommendations(fetch, heuristic); enriched != nil {
+			audit = enriched
+			if enrichedJSON != "" {
+				auditJSON = enrichedJSON
+			}
+		}
+	}
 	storeMu.Lock()
 	idCounter++
 	id := fmt.Sprintf("a%d", idCounter)
 	storeMu.Unlock()
-	res := &AnalyzeResult{ID: id, URL: fetch.URL, Title: fetch.Title, Mode: actualMode, Duration: fetch.Duration, Fetch: fetch, Output: out, PrettyJSON: pretty, Timestamp: time.Now()}
+	res := &AnalyzeResult{ID: id, URL: fetch.URL, Title: fetch.Title, Mode: actualMode, Duration: fetch.Duration, Fetch: fetch, Output: out, Audit: audit, AuditJSON: auditJSON, PrettyJSON: pretty, Timestamp: time.Now()}
 	renderAnalyzeResults(w, res)
 }
+
+func clamp(v, lo, hi int) int { if v < lo { return lo }; if v > hi { return hi }; return v }
 
 func renderAnalyzeResults(w http.ResponseWriter, res *AnalyzeResult) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	o := res.Output
 	f := res.Fetch
+	var auditHTML string
+	auditJSONEsc := template.HTMLEscapeString(res.AuditJSON)
+	if res.Audit != nil {
+		au := res.Audit
+		ringColor := "#16A34A"
+		if au.OverallScore < 50 { ringColor = "#DC2626" } else if au.OverallScore < 70 { ringColor = "#CA8A04" } else if au.OverallScore < 85 { ringColor = "#14B8A6" }
+		var ab bytes.Buffer
+		ab.WriteString(`<div class="audit-card">`)
+		ab.WriteString(fmt.Sprintf(`<div class="audit-overall"><div class="audit-ring" style="--score:%d;--ring:%s"><span class="audit-score">%d</span><span class="audit-max">/100</span></div><div class="audit-overall-meta"><span class="audit-label">%s</span><span class="audit-sub">%s · %d categories</span><span class="audit-gen">%s</span></div></div>`, au.OverallScore, ringColor, au.OverallScore, template.HTMLEscapeString(au.OverallLabel), template.HTMLEscapeString(au.GeneratedBy), len(au.Categories), template.HTMLEscapeString(au.GeneratedBy)))
+		ab.WriteString(`<div class="audit-cats">`)
+		for _, c := range au.Categories {
+			badge := "good"; if c.Score < 50 { badge = "bad" } else if c.Score < 80 { badge = "warn" }
+			ab.WriteString(fmt.Sprintf(`<div class="audit-cat audit-cat--%s"><div class="audit-cat-head"><span class="audit-cat-name">%s</span><span class="audit-cat-score">%d</span></div><div class="audit-bar"><span style="width:%d%%"></span></div>`, badge, template.HTMLEscapeString(c.Label), c.Score, clamp(c.Score, 0, 100)))
+			if len(c.Issues) > 0 {
+				ab.WriteString(`<ul class="audit-issues">`)
+				for _, is := range c.Issues {
+					sevCls := "low"; if is.Severity == "high" { sevCls = "high" } else if is.Severity == "medium" { sevCls = "med" }
+					ab.WriteString(fmt.Sprintf(`<li class="audit-issue audit-issue--%s"><span class="audit-sev">%s</span><span class="audit-issue-title">%s</span><span class="audit-issue-detail">%s</span></li>`, sevCls, template.HTMLEscapeString(is.Severity), template.HTMLEscapeString(is.Title), template.HTMLEscapeString(is.Detail)))
+				}
+				ab.WriteString(`</ul>`)
+			} else { ab.WriteString(`<div class="audit-ok">No issues — good shape</div>`) }
+			if len(c.Strengths) > 0 {
+				ab.WriteString(`<div class="audit-strengths">`)
+				for _, s := range c.Strengths { ab.WriteString(fmt.Sprintf(`<span class="audit-strength">%s</span>`, template.HTMLEscapeString(s))) }
+				ab.WriteString(`</div>`)
+			}
+			ab.WriteString(`</div>`)
+		}
+		ab.WriteString(`</div>`)
+		if len(au.TopFixes) > 0 {
+			ab.WriteString(`<div class="audit-fixes-head"><h4 class="design-title">Top fixes — do these first</h4><span class="audit-fixes-hint">Prioritized by impact / effort</span></div><div class="audit-fixes">`)
+			for _, fx := range au.TopFixes {
+				impactCls := "med"; if fx.Impact == "high" { impactCls = "high" } else if fx.Impact == "low" { impactCls = "low" }
+				effortCls := "med"; if fx.Effort == "low" { effortCls = "low" } else if fx.Effort == "high" { effortCls = "high" }
+				ab.WriteString(fmt.Sprintf(`<div class="audit-fix"><div class="audit-fix-head"><span class="audit-fix-num">#%d</span><span class="audit-fix-cat">%s</span><span class="audit-fix-title">%s</span></div><p class="audit-fix-why">%s</p><p class="audit-fix-do"><b>Fix:</b> %s</p>`, fx.Priority, template.HTMLEscapeString(fx.Category), template.HTMLEscapeString(fx.Title), template.HTMLEscapeString(fx.Why), template.HTMLEscapeString(fx.Fix)))
+				if fx.CodeSnippet != "" { ab.WriteString(fmt.Sprintf(`<pre class="audit-code">%s</pre><button class="btn btn-ghost btn-xs" onclick="copyText(this.previousElementSibling.textContent,'Snippet copied')">`+iconCopy()+` Copy snippet</button>`, template.HTMLEscapeString(fx.CodeSnippet))) }
+				ab.WriteString(fmt.Sprintf(`<div class="audit-fix-meta"><span class="audit-pill audit-pill--%s">impact %s</span><span class="audit-pill audit-pill--%s">effort %s</span></div></div>`, impactCls, template.HTMLEscapeString(fx.Impact), effortCls, template.HTMLEscapeString(fx.Effort)))
+			}
+			ab.WriteString(`</div>`)
+		}
+		ab.WriteString(fmt.Sprintf(`<details class="json-details" style="margin-top:14px"><summary>Audit JSON</summary><div class="json-wrap"><pre>%s</pre></div><textarea id="auditJson-%s" style="display:none">%s</textarea><div style="margin-top:8px"><button class="btn btn-ghost btn-xs" onclick="copyText(document.getElementById('auditJson-%s').value,'Audit JSON copied')">`+iconCopy()+` Copy Audit JSON</button></div></details>`, auditJSONEsc, res.ID, auditJSONEsc, res.ID))
+		ab.WriteString(`</div>`)
+		auditHTML = ab.String()
+	} else { auditHTML = `<div class="audit-card"><span class="muted" style="font-size:12px">No audit data</span></div>` }
 	var paletteHTML string
 	if len(o.DesignTokens.Palette) > 0 {
 		var pb bytes.Buffer
@@ -414,6 +476,7 @@ func renderAnalyzeResults(w http.ResponseWriter, res *AnalyzeResult) {
   <div class="title-row"><span class="title-label">Page</span><span class="title-value">%s</span></div>
   <div class="url-row"><a href="%s" target="_blank" rel="noopener">%s</a><span class="framework-badge" style="margin-left:8px">%s</span></div>
   <p class="analyze-summary">%s</p>
+  %s
   <div class="analyze-grid">
     <div class="analyze-section">
       <h4 class="design-title">Layout</h4>
@@ -462,6 +525,7 @@ func renderAnalyzeResults(w http.ResponseWriter, res *AnalyzeResult) {
 		template.HTMLEscapeString(res.URL), template.HTMLEscapeString(res.URL),
 		template.HTMLEscapeString(firstNonEmpty(f.Framework, o.Structure.FrameworkHint)),
 		template.HTMLEscapeString(o.Summary),
+		auditHTML,
 		template.HTMLEscapeString(o.Structure.Layout),
 		sectionsHTML,
 		template.HTMLEscapeString(o.Structure.Navigation),
